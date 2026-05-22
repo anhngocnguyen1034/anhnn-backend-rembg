@@ -230,10 +230,11 @@ def s_command(port: int, host: str, log_level: str, threads: int, no_ui: bool) -
 
     @app.on_event("startup")
     def startup():
-        try:
-            webbrowser.open(f"http://localhost:{port}")
-        except Exception:
-            pass
+        if not no_ui:
+            try:
+                webbrowser.open(f"http://localhost:{port}")
+            except Exception:
+                pass
 
         if threads is not None:
             from anyio import CapacityLimiter
