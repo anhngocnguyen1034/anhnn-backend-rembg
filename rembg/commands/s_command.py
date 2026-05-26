@@ -20,6 +20,7 @@ from ..bg import remove
 from ..session_factory import new_session
 from ..sessions import sessions_names
 from ..sessions.base import BaseSession
+from ..upscale import UPSCALE_MODEL_NAMES, upscale_bytes
 
 
 @click.command(  # type: ignore
@@ -80,6 +81,14 @@ def s_command(port: int, host: str, log_level: str, threads: int, no_ui: bool) -
             "externalDocs": {
                 "description": "GitHub Source",
                 "url": "https://github.com/danielgatis/rembg",
+            },
+        },
+        {
+            "name": "Upscale",
+            "description": "Endpoints that upscale images using Real-ESRGAN.",
+            "externalDocs": {
+                "description": "GitHub Source",
+                "url": "https://github.com/xinntao/Real-ESRGAN",
             },
         },
     ]
@@ -304,6 +313,114 @@ def s_command(port: int, host: str, log_level: str, threads: int, no_ui: bool) -
         commons: CommonQueryPostParams = Depends(),
     ):
         return await asyncify(im_without_bg)(file, commons)  # type: ignore
+
+    _upscale_model_regex = r"(" + "|".join(UPSCALE_MODEL_NAMES) + ")"
+
+    class UpscaleQueryParams:
+        def __init__(
+            self,
+            model: str = Query(
+                description="Real-ESRGAN model to use",
+                regex=_upscale_model_regex,
+                default="RealESRGAN_x4plus",
+            ),
+            outscale: float = Query(
+                default=4.0, gt=0, le=16, description="Final upscale factor"
+            ),
+            half: bool = Query(
+                default=False, description="Use fp16 (only useful on CUDA)"
+            ),
+            tile: int = Query(
+                default=0, ge=0, description="Tile size; 0 disables tiling"
+            ),
+            tile_pad: int = Query(default=10, ge=0, description="Tile padding"),
+            pre_pad: int = Query(default=0, ge=0, description="Pre padding"),
+        ):
+            self.model = model
+            self.outscale = outscale
+            self.half = half
+            self.tile = tile
+            self.tile_pad = tile_pad
+            self.pre_pad = pre_pad
+
+    class UpscaleQueryPostParams:
+        def __init__(
+            self,
+            model: str = Form(
+                description="Real-ESRGAN model to use",
+                regex=_upscale_model_regex,
+                default="RealESRGAN_x4plus",
+            ),
+            outscale: float = Form(
+                default=4.0, gt=0, le=16, description="Final upscale factor"
+            ),
+            half: bool = Form(
+                default=False, description="Use fp16 (only useful on CUDA)"
+            ),
+            tile: int = Form(
+                default=0, ge=0, description="Tile size; 0 disables tiling"
+            ),
+            tile_pad: int = Form(default=10, ge=0, description="Tile padding"),
+            pre_pad: int = Form(default=0, ge=0, description="Pre padding"),
+        ):
+            self.model = model
+            self.outscale = outscale
+            self.half = half
+            self.tile = tile
+            self.tile_pad = tile_pad
+            self.pre_pad = pre_pad
+
+    def im_upscaled(content: bytes, commons) -> Response:
+        try:
+            out = upscale_bytes(
+                content,
+                model_name=commons.model,
+                outscale=commons.outscale,
+                half=commons.half,
+                tile=commons.tile,
+                tile_pad=commons.tile_pad,
+                pre_pad=commons.pre_pad,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Upscale failed: {e}")
+        return Response(out, media_type="image/png")
+
+    @app.get(
+        path="/api/upscale",
+        tags=["Upscale"],
+        summary="Upscale from URL",
+        description="Upscales an image obtained by retrieving an URL.",
+    )
+    async def get_upscale(
+        url: str = Query(
+            default=..., description="URL of the image that has to be processed."
+        ),
+        commons: UpscaleQueryParams = Depends(),
+    ):
+        try:
+            _validate_url(url)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                file = await response.read()
+                return await asyncify(im_upscaled)(file, commons)
+
+    @app.post(
+        path="/api/upscale",
+        tags=["Upscale"],
+        summary="Upscale from Stream",
+        description="Upscales an image sent within the request itself.",
+    )
+    async def post_upscale(
+        file: bytes = File(
+            default=...,
+            description="Image file (byte stream) that has to be processed.",
+        ),
+        commons: UpscaleQueryPostParams = Depends(),
+    ):
+        return await asyncify(im_upscaled)(file, commons)  # type: ignore
 
     def gr_app(app):
         def inference(input_path, model, *args):
