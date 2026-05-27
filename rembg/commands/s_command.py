@@ -1,7 +1,9 @@
 import ipaddress
 import json
+import logging
 import os
 import socket
+import traceback
 import webbrowser
 from typing import Optional, Tuple, cast
 from urllib.parse import urlparse
@@ -20,7 +22,7 @@ from ..bg import remove
 from ..session_factory import new_session
 from ..sessions import sessions_names
 from ..sessions.base import BaseSession
-from ..upscale import UPSCALE_MODEL_NAMES, upscale_bytes
+from ..upscale import UPSCALE_MODEL_NAMES, UpscaleInputTooLarge, upscale_bytes
 
 
 @click.command(  # type: ignore
@@ -322,7 +324,7 @@ def s_command(port: int, host: str, log_level: str, threads: int, no_ui: bool) -
             model: str = Query(
                 description="Real-ESRGAN model to use",
                 regex=_upscale_model_regex,
-                default="RealESRGAN_x4plus",
+                default="realesr-general-x4v3",
             ),
             outscale: float = Query(
                 default=4.0, gt=0, le=16, description="Final upscale factor"
@@ -331,7 +333,13 @@ def s_command(port: int, host: str, log_level: str, threads: int, no_ui: bool) -
                 default=False, description="Use fp16 (only useful on CUDA)"
             ),
             tile: int = Query(
-                default=0, ge=0, description="Tile size; 0 disables tiling"
+                default=256,
+                ge=0,
+                description=(
+                    "Tile size for the upscaler. 0 means 'no tiling' which "
+                    "can OOM on large images / low-RAM hosts; the server "
+                    "rewrites 0 to a safe default."
+                ),
             ),
             tile_pad: int = Query(default=10, ge=0, description="Tile padding"),
             pre_pad: int = Query(default=0, ge=0, description="Pre padding"),
@@ -339,7 +347,7 @@ def s_command(port: int, host: str, log_level: str, threads: int, no_ui: bool) -
             self.model = model
             self.outscale = outscale
             self.half = half
-            self.tile = tile
+            self.tile = tile if tile > 0 else 256
             self.tile_pad = tile_pad
             self.pre_pad = pre_pad
 
@@ -349,7 +357,7 @@ def s_command(port: int, host: str, log_level: str, threads: int, no_ui: bool) -
             model: str = Form(
                 description="Real-ESRGAN model to use",
                 regex=_upscale_model_regex,
-                default="RealESRGAN_x4plus",
+                default="realesr-general-x4v3",
             ),
             outscale: float = Form(
                 default=4.0, gt=0, le=16, description="Final upscale factor"
@@ -358,7 +366,13 @@ def s_command(port: int, host: str, log_level: str, threads: int, no_ui: bool) -
                 default=False, description="Use fp16 (only useful on CUDA)"
             ),
             tile: int = Form(
-                default=0, ge=0, description="Tile size; 0 disables tiling"
+                default=256,
+                ge=0,
+                description=(
+                    "Tile size for the upscaler. 0 means 'no tiling' which "
+                    "can OOM on large images / low-RAM hosts; the server "
+                    "rewrites 0 to a safe default."
+                ),
             ),
             tile_pad: int = Form(default=10, ge=0, description="Tile padding"),
             pre_pad: int = Form(default=0, ge=0, description="Pre padding"),
@@ -366,11 +380,14 @@ def s_command(port: int, host: str, log_level: str, threads: int, no_ui: bool) -
             self.model = model
             self.outscale = outscale
             self.half = half
-            self.tile = tile
+            self.tile = tile if tile > 0 else 256
             self.tile_pad = tile_pad
             self.pre_pad = pre_pad
 
+    _upscale_logger = logging.getLogger("rembg.upscale")
+
     def im_upscaled(content: bytes, commons) -> Response:
+        resize_info: dict = {}
         try:
             out = upscale_bytes(
                 content,
@@ -380,10 +397,29 @@ def s_command(port: int, host: str, log_level: str, threads: int, no_ui: bool) -
                 tile=commons.tile,
                 tile_pad=commons.tile_pad,
                 pre_pad=commons.pre_pad,
+                resize_info=resize_info,
             )
+        except ImportError as e:
+            _upscale_logger.error("Upscale dependency missing:\n%s", traceback.format_exc())
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Upscale feature unavailable: {e}. "
+                    "Install torch + realesrgan + basicsr in the server environment."
+                ),
+            )
+        except UpscaleInputTooLarge as e:
+            raise HTTPException(status_code=413, detail=str(e))
         except Exception as e:
+            _upscale_logger.error("Upscale failed:\n%s", traceback.format_exc())
             raise HTTPException(status_code=500, detail=f"Upscale failed: {e}")
-        return Response(out, media_type="image/png")
+        headers = {}
+        if resize_info:
+            ow, oh = resize_info["original"]
+            nw, nh = resize_info["resized"]
+            headers["X-Upscale-Original-Size"] = f"{ow}x{oh}"
+            headers["X-Upscale-Resized-Input"] = f"{nw}x{nh}"
+        return Response(out, media_type="image/png", headers=headers)
 
     @app.get(
         path="/api/upscale",

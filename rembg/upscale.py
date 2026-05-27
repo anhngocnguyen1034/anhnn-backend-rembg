@@ -7,11 +7,17 @@ once and reused across requests.
 
 from __future__ import annotations
 
+import gc
+import logging
+import math
+from collections import OrderedDict
 from io import BytesIO
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 from PIL import Image
+
+_logger = logging.getLogger(__name__)
 
 # (url, netscale, arch, arch_kwargs)
 MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
@@ -53,7 +59,20 @@ MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
 
 UPSCALE_MODEL_NAMES = tuple(MODEL_CONFIGS.keys())
 
-_upsamplers: Dict[Tuple[str, bool, int, int, int], Any] = {}
+# Cap input pixels to keep CPU/RAM in check. Tuned for 8GB M1 Air / CPU fp32.
+# 1.5 MP ~= sqrt(1.5e6) ≈ 1224x1224. At outscale=4 that's ~4900x4900 output.
+MAX_INPUT_MEGAPIXELS = 1.5
+
+# Keep at most this many RealESRGANer instances alive. Each one holds the
+# model weights in RAM, so unbounded caching across (tile, pad) variants
+# is itself an OOM source.
+_MAX_CACHED_UPSAMPLERS = 2
+
+_upsamplers: "OrderedDict[Tuple[str, bool, int, int, int], Any]" = OrderedDict()
+
+
+class UpscaleInputTooLarge(ValueError):
+    """Raised when the input image exceeds MAX_INPUT_MEGAPIXELS."""
 
 
 def _build_upsampler(
@@ -101,9 +120,9 @@ def _build_upsampler(
 
 
 def get_upsampler(
-    model_name: str = "RealESRGAN_x4plus",
+    model_name: str = "realesr-general-x4v3",
     half: bool = False,
-    tile: int = 0,
+    tile: int = 256,
     tile_pad: int = 10,
     pre_pad: int = 0,
 ):
@@ -114,27 +133,66 @@ def get_upsampler(
             f"Available: {', '.join(MODEL_CONFIGS)}"
         )
     key = (model_name, half, tile, tile_pad, pre_pad)
-    if key not in _upsamplers:
-        _upsamplers[key] = _build_upsampler(model_name, half, tile, tile_pad, pre_pad)
-    return _upsamplers[key]
+    if key in _upsamplers:
+        _upsamplers.move_to_end(key)
+        return _upsamplers[key]
+
+    upsampler = _build_upsampler(model_name, half, tile, tile_pad, pre_pad)
+    _upsamplers[key] = upsampler
+    while len(_upsamplers) > _MAX_CACHED_UPSAMPLERS:
+        _upsamplers.popitem(last=False)
+        gc.collect()
+    return upsampler
 
 
 def upscale_bytes(
     content: bytes,
-    model_name: str = "RealESRGAN_x4plus",
+    model_name: str = "realesr-general-x4v3",
     outscale: float = 4.0,
     half: bool = False,
-    tile: int = 0,
+    tile: int = 256,
     tile_pad: int = 10,
     pre_pad: int = 0,
+    auto_resize: bool = True,
+    resize_info: Optional[Dict[str, Tuple[int, int]]] = None,
 ) -> bytes:
-    """Upscale an image given as raw bytes and return PNG bytes."""
+    """Upscale an image given as raw bytes and return PNG bytes.
+
+    If ``auto_resize`` is True and the input exceeds MAX_INPUT_MEGAPIXELS,
+    the image is downscaled to fit before feeding the model. The caller can
+    pass a ``resize_info`` dict; it will be populated with
+    ``{"original": (w, h), "resized": (w, h)}`` when a resize happens.
+    """
+    if tile <= 0:
+        tile = 256
+
     img = Image.open(BytesIO(content))
+    original_size = (img.width, img.height)
+    megapixels = (img.width * img.height) / 1_000_000
+    if megapixels > MAX_INPUT_MEGAPIXELS:
+        if not auto_resize:
+            raise UpscaleInputTooLarge(
+                f"Input image is {megapixels:.1f} MP ({img.width}x{img.height}); "
+                f"max allowed is {MAX_INPUT_MEGAPIXELS} MP."
+            )
+        ratio = math.sqrt(MAX_INPUT_MEGAPIXELS / megapixels)
+        new_w = max(1, int(img.width * ratio))
+        new_h = max(1, int(img.height * ratio))
+        _logger.warning(
+            "Auto-resizing upscale input %dx%d (%.2f MP) -> %dx%d to fit %.2f MP cap",
+            img.width, img.height, megapixels, new_w, new_h, MAX_INPUT_MEGAPIXELS,
+        )
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+        if resize_info is not None:
+            resize_info["original"] = original_size
+            resize_info["resized"] = (new_w, new_h)
+
     has_alpha = img.mode in ("RGBA", "LA") or (
         img.mode == "P" and "transparency" in img.info
     )
     img = img.convert("RGBA" if has_alpha else "RGB")
     img_np = np.array(img)
+    del img
 
     # RealESRGANer.enhance expects BGR(A) numpy arrays (OpenCV convention).
     if img_np.shape[2] == 4:
@@ -150,6 +208,7 @@ def upscale_bytes(
         pre_pad=pre_pad,
     )
     output, _ = upsampler.enhance(img_np, outscale=outscale)
+    del img_np
 
     if output.shape[2] == 4:
         output = output[:, :, [2, 1, 0, 3]]
@@ -158,4 +217,6 @@ def upscale_bytes(
 
     buf = BytesIO()
     Image.fromarray(output).save(buf, format="PNG")
+    del output
+    gc.collect()
     return buf.getvalue()
