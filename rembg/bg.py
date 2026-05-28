@@ -1,7 +1,10 @@
 import io
+import logging
+import math
+import os
 import sys
 from enum import Enum
-from typing import Any, List, Optional, Tuple, Union, cast
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 import numpy as np
 
@@ -34,6 +37,36 @@ from .sessions.base import BaseSession
 ort.set_default_logger_severity(3)
 
 kernel = disk(1)
+
+_logger = logging.getLogger(__name__)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        _logger.warning("Invalid float for %s=%r; falling back to %s", name, raw, default)
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+# Cap input pixels to keep CPU/RAM in check. Large phone photos through
+# alpha_matting can otherwise allocate several GB of float64 buffers and OOM
+# low-RAM hosts. Override with REMBG_MAX_INPUT_MEGAPIXELS.
+DEFAULT_MAX_INPUT_MEGAPIXELS = 4.0
+
+
+class RemoveInputTooLarge(ValueError):
+    """Raised when the input image exceeds the configured megapixel cap."""
 
 
 class ReturnType(Enum):
@@ -234,6 +267,9 @@ def remove(
     post_process_mask: bool = False,
     bgcolor: Optional[Tuple[int, int, int, int]] = None,
     force_return_bytes: bool = False,
+    max_input_megapixels: Optional[float] = None,
+    auto_resize: Optional[bool] = None,
+    resize_info: Optional[Dict[str, Tuple[int, int]]] = None,
     *args: Optional[Any],
     **kwargs: Optional[Any],
 ) -> Union[bytes, PILImage, np.ndarray]:
@@ -279,6 +315,35 @@ def remove(
 
     # Fix image orientation
     img = fix_image_orientation(img)
+
+    if max_input_megapixels is None:
+        max_input_megapixels = _env_float(
+            "REMBG_MAX_INPUT_MEGAPIXELS", DEFAULT_MAX_INPUT_MEGAPIXELS
+        )
+    if auto_resize is None:
+        auto_resize = _env_bool("REMBG_AUTO_RESIZE", True)
+
+    if max_input_megapixels > 0:
+        megapixels = (img.width * img.height) / 1_000_000
+        if megapixels > max_input_megapixels:
+            original_size = (img.width, img.height)
+            if not auto_resize:
+                raise RemoveInputTooLarge(
+                    f"Input image is {megapixels:.1f} MP "
+                    f"({img.width}x{img.height}); max allowed is "
+                    f"{max_input_megapixels} MP."
+                )
+            ratio = math.sqrt(max_input_megapixels / megapixels)
+            new_w = max(1, int(img.width * ratio))
+            new_h = max(1, int(img.height * ratio))
+            _logger.warning(
+                "Auto-resizing remove input %dx%d (%.2f MP) -> %dx%d to fit %.2f MP cap",
+                img.width, img.height, megapixels, new_w, new_h, max_input_megapixels,
+            )
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+            if resize_info is not None:
+                resize_info["original"] = original_size
+                resize_info["resized"] = (new_w, new_h)
 
     if session is None:
         session = new_session("u2net", *args, **kwargs)

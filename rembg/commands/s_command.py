@@ -18,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import Response
 
 from .. import __version__
-from ..bg import remove
+from ..bg import RemoveInputTooLarge, remove
 from ..session_factory import new_session
 from ..sessions import sessions_names
 from ..sessions.base import BaseSession
@@ -223,8 +223,9 @@ def s_command(port: int, host: str, log_level: str, threads: int, no_ui: bool) -
             session = new_session(commons.model, **kwargs)
             sessions[commons.model] = session
 
-        return Response(
-            remove(
+        resize_info: dict = {}
+        try:
+            out = remove(
                 content,
                 session=session,
                 alpha_matting=commons.a,
@@ -234,10 +235,19 @@ def s_command(port: int, host: str, log_level: str, threads: int, no_ui: bool) -
                 only_mask=commons.om,
                 post_process_mask=commons.ppm,
                 bgcolor=commons.bgc,
+                resize_info=resize_info,
                 **kwargs,
-            ),
-            media_type="image/png",
-        )
+            )
+        except RemoveInputTooLarge as e:
+            raise HTTPException(status_code=413, detail=str(e))
+
+        headers = {}
+        if resize_info:
+            ow, oh = resize_info["original"]
+            nw, nh = resize_info["resized"]
+            headers["X-Remove-Original-Size"] = f"{ow}x{oh}"
+            headers["X-Remove-Resized-Input"] = f"{nw}x{nh}"
+        return Response(out, media_type="image/png", headers=headers)
 
     @app.on_event("startup")
     def startup():
