@@ -184,6 +184,15 @@ rembg s --host 0.0.0.0 --port 7000 --log_level info
 
 For complete API documentation, visit: `http://localhost:7000/api`
 
+**Available endpoints:**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/remove?url=<image-url>` | Remove background from an image fetched from a URL. |
+| `POST` | `/api/remove` | Remove background from an uploaded image (multipart `file`). |
+| `GET` | `/api/upscale?url=<image-url>` | Upscale an image fetched from a URL (Real-ESRGAN). |
+| `POST` | `/api/upscale` | Upscale an uploaded image (multipart `file`, Real-ESRGAN). |
+
 **Disable the Gradio UI (reduces idle CPU usage):**
 
 ```shell
