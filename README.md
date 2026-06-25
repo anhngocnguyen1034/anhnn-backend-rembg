@@ -202,6 +202,39 @@ curl -s "http://localhost:7000/api/remove?url=http://input.png" -o output.png
 curl -s -F file=@/path/to/input.jpg "http://localhost:7000/api/remove" -o output.png
 ```
 
+#### Image upscaling (Real-ESRGAN)
+
+The HTTP server also exposes `/api/upscale` to enlarge images with [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN). This requires extra dependencies in the server environment:
+
+```shell
+pip install torch realesrgan basicsr
+```
+
+**Upscale an uploaded image (4x by default):**
+
+```shell
+curl -s -F file=@/path/to/input.png "http://localhost:7000/api/upscale" -o output.png
+```
+
+**Upscale from a URL with a specific model and factor:**
+
+```shell
+curl -s "http://localhost:7000/api/upscale?url=http://input.png&model=realesr-general-x4v3&outscale=2" -o output.png
+```
+
+**Query/form parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `model` | `realesr-general-x4v3` | One of `RealESRGAN_x4plus`, `RealESRNet_x4plus`, `RealESRGAN_x4plus_anime_6B`, `RealESRGAN_x2plus`, `realesr-animevideov3`, `realesr-general-x4v3`. |
+| `outscale` | `4.0` | Final upscale factor (`0 < outscale <= 16`). |
+| `half` | `false` | Use fp16 (only useful on CUDA). |
+| `tile` | `256` | Tile size. `0` is rewritten to a safe default to avoid OOM on large images / low-RAM hosts. |
+| `tile_pad` | `10` | Tile padding. |
+| `pre_pad` | `0` | Pre padding. |
+
+> **Note:** Inputs are capped at **1.5 MP** to keep CPU/RAM usage bounded. Larger images are automatically downscaled before upscaling; the response includes `X-Upscale-Original-Size` and `X-Upscale-Resized-Input` headers when this happens. Oversized inputs that cannot be handled return HTTP `413`.
+
 ### rembg `b`
 
 Process a sequence of RGB24 images from stdin. This is intended to be used with programs like FFmpeg that output RGB24 pixel data to stdout.
@@ -295,6 +328,11 @@ for file in Path('path/to/folder').glob('*.png'):
 
 For more examples, see the [examples](USAGE.md) page.
 
+## Integration guides
+
+- [FRONTEND.md](FRONTEND.md) — how to call the HTTP API from a web/mobile frontend (fetch, React, Next.js API route).
+- [ANDROID.md](ANDROID.md) — integrating the backend from an Android app using Kotlin + Jetpack Compose.
+
 ## Usage with Docker
 
 ### CPU Only
@@ -361,6 +399,8 @@ All models are automatically downloaded and saved to `~/.u2net/` on first use.
 | `XDG_DATA_HOME` | Base data directory used when `U2NET_HOME` is not set. Defaults to `~`. |
 | `MODEL_CHECKSUM_DISABLED` | When set (e.g. `MODEL_CHECKSUM_DISABLED=1`), disables hash verification for downloaded models. This is useful if you want to use your own custom/converted model files without rembg re-downloading the originals. |
 | `OMP_NUM_THREADS` | Sets the number of threads used by ONNX Runtime for inference. |
+| `REMBG_MAX_INPUT_MEGAPIXELS` | Caps the input image size (in megapixels) for `remove` to keep memory bounded on low-RAM hosts. Defaults to `4.0`. Large phone photos through alpha matting can otherwise allocate several GB and OOM. |
+| `REMBG_AUTO_RESIZE` | When `true` (default), inputs larger than `REMBG_MAX_INPUT_MEGAPIXELS` are automatically downscaled instead of rejected. Set to `0`/`false` to raise an error instead. |
 
 ### Using custom model files
 
